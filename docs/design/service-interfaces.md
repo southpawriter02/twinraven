@@ -15,6 +15,7 @@
   - [Exporter](#exporter)
 - [Huginn Interfaces](#huginn-interfaces)
   - [Miner](#miner)
+  - [CandidateStore](#candidatestore)
   - [Synthesizer](#synthesizer)
   - [Validator](#validator)
   - [LLMProvider](#llmprovider)
@@ -247,8 +248,52 @@ class MiningConfig:
 #### Design Notes
 
 - The `Miner` reads from `EventStore` but never writes to it.
-- Results are not persisted by the `Miner` itself. The orchestration layer decides whether to store candidates for later review.
+- Results are persisted via the [CandidateStore](#candidatestore) interface by the orchestration layer. The Miner itself is stateless.
 - The `algorithm` field determines the internal pipeline: `"prefixspan"` runs PrefixSpan directly; `"gsp"` runs PrefixSpan first and then applies time-window filtering as a post-processing step.
+
+---
+
+### CandidateStore
+
+Persists `CandidateChain` objects produced by the Miner. Enables review of past mining results without re-running the mining pipeline.
+
+```python
+class CandidateStore(Protocol):
+    """Persistence for candidate chains from mining runs."""
+
+    async def save(self, chain: CandidateChain) -> None: ...
+
+    async def save_batch(self, chains: list[CandidateChain]) -> None: ...
+
+    async def get_by_id(self, chain_id: UUID) -> CandidateChain | None: ...
+
+    async def list_candidates(
+        self,
+        *,
+        min_support: float | None = None,
+        min_confidence: float | None = None,
+        since: datetime | None = None,
+        limit: int | None = None,
+    ) -> list[CandidateChain]: ...
+
+    async def delete(self, chain_id: UUID) -> bool: ...
+```
+
+#### Method Contracts
+
+| Method            | Preconditions                                                                     | Postconditions                                                          | Errors                                     |
+| ----------------- | --------------------------------------------------------------------------------- | ----------------------------------------------------------------------- | ------------------------------------------ |
+| `save`            | `chain.chain_id` must not already exist.                                          | Chain is durably persisted.                                             | `DuplicateCandidateError`. `StorageError`. |
+| `save_batch`      | All `chain_id` values must be unique within the batch and not exist in the store. | All chains persisted atomically.                                        | `DuplicateCandidateError`. `StorageError`. |
+| `get_by_id`       | None.                                                                             | Returns `None` if not found.                                            | `StorageError`.                            |
+| `list_candidates` | Filter values must be in valid ranges if provided.                                | Returns candidates matching filters, ordered by `support` descending.   | `StorageError`.                            |
+| `delete`          | None.                                                                             | Removes the candidate. Returns `True` if deleted, `False` if not found. | `StorageError`.                            |
+
+#### Design Notes
+
+- The `CandidateStore` is intentionally lightweight. Candidates are immutable once saved; there is no update method.
+- Deletion is supported for housekeeping (clearing stale candidates after a chain has been synthesized or rejected), not for correction.
+- The orchestration layer calls `save_batch` after each mining run and `delete` after a candidate is consumed by the Synthesizer or explicitly rejected.
 
 ---
 
@@ -321,12 +366,13 @@ class ValidationConfig:
 
 #### Replay Protocol
 
+Validation is **purely offline**. It does not invoke real tools or produce real side effects. All comparisons use recorded data from the event log.
+
 1. **Session selection** — Queries the `EventStore` for sessions containing the source chain's tool sequence. Selects up to `min_replay_sessions` sessions, preferring recent sessions.
-2. **Input extraction** — For each selected session, extracts the initial inputs that triggered the chain.
-3. **Simulated execution** — Runs the composite tool's execution plan against the extracted inputs (using the original tool implementations, not the LLM).
-4. **Output comparison** — Compares the composite tool's outputs to the chain's original outputs using the configured similarity method.
-5. **Latency comparison** — Compares aggregate execution time.
-6. **Error replay** — For sessions where the original chain encountered failures, verifies that the composite tool's error strategy handles them at least as well.
+2. **Input extraction** — For each selected session, extracts the recorded inputs that triggered the chain.
+3. **Output comparison** — Feeds the recorded initial inputs through the composite tool's parameter merging and internal wiring logic, then compares the _expected_ final outputs (from the event log's `output_summary` fields) to what the composite tool's step sequence would produce given those same intermediate outputs. No tools are actually executed.
+4. **Latency estimation** — Sums the recorded `latency_ms` values for the composite tool's steps and compares against the original chain's total recorded latency.
+5. **Error strategy verification** — For sessions where the original chain encountered failures, verifies that the composite tool's `ErrorStrategy` would have handled the failure mode (retry, fallback, or abort) based on the recorded outcome and error context.
 
 ---
 
@@ -478,6 +524,7 @@ class ExportDestinationExistsError(ExportError): ...
 
 # Huginn errors
 class MiningConfigError(TwinRavenError): ...
+class DuplicateCandidateError(TwinRavenError): ...
 class SynthesisError(TwinRavenError): ...
 class SchemaValidationError(SynthesisError): ...
 class ValidationError(TwinRavenError): ...
@@ -518,6 +565,7 @@ graph TD
 
     subgraph Huginn
         MI["Miner"]
+        CS["CandidateStore"]
         SY["Synthesizer"]
         VA["Validator"]
         LLM["LLMProvider"]
@@ -532,7 +580,9 @@ graph TD
     C -->|"writes via"| ES
     EX -->|"reads via"| ES
     MI -->|"reads via"| ES
+    MI -.->|"results saved to"| CS
     SY -->|"reads via"| ES
+    SY -->|"reads from"| CS
     SY -->|"calls"| LLM
     VA -->|"reads via"| ES
     TR -->|"receives from"| SY
@@ -543,14 +593,14 @@ graph TD
 
 ---
 
-## Appendix: Open Questions
+## Appendix: Resolved Decisions
 
-The following items surfaced during specification and may warrant discussion:
+The following design questions were resolved during specification review:
 
-1. **Output compression coupling.** The `Collector` currently owns output compression (LLM summarization of tool output). Should this be a separate `OutputCompressor` interface to keep the Collector focused on event construction?
+1. **Output compression stays in the Collector.** Compression is a single step in the `record` flow, tightly coupled to event construction. Extracting it into a separate `OutputCompressor` interface would add indirection without meaningful benefit at this stage. If compression logic grows in complexity (e.g., multiple strategies, pluggable summarizers), it can be extracted later.
 
-2. **Candidate persistence.** The `Miner` returns `CandidateChain` objects but does not persist them. Should there be a `CandidateStore` interface, or should candidates be ephemeral and re-mined on demand?
+2. **CandidateStore interface added.** A lightweight `CandidateStore` protocol was added to persist `CandidateChain` objects between mining runs. This avoids re-mining on demand and enables review of historical candidates through the CLI. The interface is intentionally minimal (save, list, delete) since candidates are immutable.
 
-3. **Validation execution model.** The Validator "runs" the composite tool against historical inputs. Does it invoke the real underlying tools (with real side effects), or does it use recorded outputs for a purely offline comparison? The current spec implies offline replay, but this should be made explicit.
+3. **Validation is purely offline.** The Validator compares against recorded outputs from the event log. It does not invoke real tools or produce real side effects. This avoids the cost and unpredictability of re-executing tool chains during validation.
 
-4. **Registry concurrency.** The `ToolRegistry` uses `filelock` for concurrent writes. Should the interface expose any concurrency semantics (e.g., optimistic locking, compare-and-swap on version), or is that purely an implementation detail?
+4. **Registry concurrency is an implementation detail.** The `ToolRegistry` protocol does not expose locking semantics. Concurrency control (via `filelock` or database-level locking) is handled internally by the implementation. Callers interact with a clean async interface.
