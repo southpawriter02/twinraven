@@ -9,19 +9,23 @@
 ## Table of Contents
 
 - [Collector Internals](#collector-internals)
+  - [Integration Hookup](#integration-hookup)
   - [Context Manager Lifecycle](#context-manager-lifecycle)
   - [Predecessor/Successor Management](#predecessorsuccessor-management)
   - [Output Compression](#output-compression)
   - [Buffering Strategy](#buffering-strategy)
+  - [Failure Scenarios](#failure-scenarios)
 - [EventStore Implementation](#eventstore-implementation)
   - [SQLAlchemy Model](#sqlalchemy-model)
   - [Indexing Strategy](#indexing-strategy)
   - [Connection Management](#connection-management)
   - [Chain Reconstruction](#chain-reconstruction)
 - [Exporters](#exporters)
+  - [Streaming and Backpressure](#streaming-and-backpressure)
   - [JSON Lines Exporter](#json-lines-exporter)
   - [Parquet Exporter](#parquet-exporter)
   - [OTLP Exporter](#otlp-exporter)
+  - [Error Handling and Recovery](#error-handling-and-recovery)
 - [Retention and Pruning](#retention-and-pruning)
 - [Configuration](#configuration)
 
@@ -30,6 +34,67 @@
 ## Collector Internals
 
 The `Collector` is the primary write-path entry point. Integrations interact exclusively with the Collector; they never write to the `EventStore` directly.
+
+### Integration Hookup
+
+The Collector exposes a single entry point, `observe()`, which returns an async context manager. Everything an integration needs to capture telemetry flows through this one call.
+
+**LangChain integration (typical):**
+
+```python
+from twinraven import Collector
+from twinraven.integrations.langchain import LangChainWrapper
+
+# 1. Create a collector (once, at application startup)
+collector = Collector(event_store=event_store, config=muninn_config)
+
+# 2. Wrap existing tools (once, at agent setup)
+wrapper = LangChainWrapper()
+tools = [wrapper.wrap(tool, collector) for tool in original_tools]
+
+# 3. Run the agent — telemetry is captured automatically
+agent = create_agent(llm, tools)
+async with collector.observe(session_id="task-42") as ctx:
+    # Every tool call inside this block is recorded.
+    # The wrapper calls ctx.record() transparently.
+    result = await agent.ainvoke({"input": "Find and summarize the report"})
+```
+
+**Custom agent (no framework):**
+
+```python
+from twinraven import Collector
+
+collector = Collector(event_store=event_store, config=muninn_config)
+
+async with collector.observe(session_id="manual-session-1") as ctx:
+    # Record tool calls explicitly
+    search_result = await search_tool(query="quarterly report")
+    event1 = await ctx.record(
+        tool_id="search",
+        input_params={"query": "quarterly report"},
+        output=search_result,
+        outcome=Outcome.SUCCESS,
+    )
+
+    # Record a failure
+    try:
+        content = await read_tool(url=search_result["url"])
+    except TimeoutError as e:
+        event2 = await ctx.record_failure(
+            tool_id="read",
+            input_params={"url": search_result["url"]},
+            error=e,
+            tags=["timeout", "retry-candidate"],
+        )
+```
+
+**Key guarantees for integrations:**
+
+1. The context manager is **non-blocking on enter**. It initializes state and verifies store connectivity but does not issue any writes until `record()` is called.
+2. Calling `record()` outside of a context raises `CollectorError`. The context must be active.
+3. Multiple concurrent contexts for different `session_id` values are supported. Each `ObservationContext` tracks its own predecessor chain independently.
+4. A single context should **not** be shared across threads or tasks. One context = one logical session = one sequential chain of tool calls.
 
 ### Context Manager Lifecycle
 
@@ -153,6 +218,23 @@ muninn:
 
 Buffered events are flushed via `EventStore.append_batch()` for atomicity.
 
+### Failure Scenarios
+
+The Collector is designed to be resilient: telemetry failures should never crash the agent. Each failure mode has a defined, predictable behavior.
+
+| Scenario                                      | What happens                                                                  | Impact on session                                                                                                                                                                  | Recovery                                                                                                   |
+| --------------------------------------------- | ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| **Store unavailable on `observe()` entry**    | `_check_connectivity()` fails, `CollectorError` raised.                       | Context never opens. No events recorded.                                                                                                                                           | Integration catches the error and decides whether to run without telemetry or abort.                       |
+| **Store unavailable during `record()`**       | `EventStore.append()` raises `StorageError`.                                  | The failed event is **lost**. The `ObservationContext` logs the failure at `ERROR` and continues accepting subsequent `record()` calls. Predecessor chain is broken at this point. | Subsequent `record()` calls succeed if the store recovers. The gap is visible during chain reconstruction. |
+| **Output compression (LLM) fails**            | LLM call raises `LLMProviderError` or times out.                              | Falls back to truncation: `output[:max_output_length] + "... [truncated]"`. Event is still recorded.                                                                               | No recovery needed; degraded output quality is acceptable. Logged at `WARNING`.                            |
+| **Tool raises exception mid-call**            | Integration catches the exception and calls `record_failure()`.               | A `MuninnEvent` with `outcome=FAILURE` is created. The error message and traceback summary are stored in `output_summary`.                                                         | Normal flow; this is the designed path for tool failures.                                                  |
+| **Agent crashes (context never exits)**       | `__aexit__` is never called.                                                  | **Immediate mode:** All events up to the crash are persisted (each `record()` call writes immediately). **Buffered mode:** Events in the unflushed buffer are lost.                | Partial session is visible in the event log. Mining handles sessions of any length.                        |
+| **Exception propagates through context exit** | `__aexit__` receives the exception info.                                      | Buffered events are flushed (best effort). Session summary is logged at `WARNING` instead of `INFO`. The exception is **not** suppressed; it re-raises after cleanup.              | Events already persisted are retained. The session appears truncated but valid.                            |
+| **Backfill UPDATE fails**                     | Predecessor's `successor` field isn't updated, but the new event is appended. | Forward chain has a gap at this link. `predecessor` on the new event is correct; `successor` on the old event is `None`.                                                           | Chain reconstruction falls back to timestamp ordering for the gap. Logged at `WARNING`.                    |
+| **Buffered flush fails**                      | `append_batch()` raises `StorageError`.                                       | The entire batch is lost if the store rejects it.                                                                                                                                  | The buffer is cleared (no retry). Subsequent batches attempt independent writes. Logged at `ERROR`.        |
+
+**Design philosophy:** The Collector follows a _best-effort, never-fatal_ pattern. Telemetry is valuable but secondary to the agent's primary task. Every failure path either degrades gracefully (compression fallback, chain gaps) or fails silently with logging (store unavailability). The only exception that propagates to the integration is the initial `observe()` connectivity check, giving the integration a chance to decide up front.
+
 ---
 
 ## EventStore Implementation
@@ -234,7 +316,25 @@ class AsyncEventStoreEngine:
 
 ## Exporters
 
-All exporters implement the `Exporter` protocol and accept an `AsyncIterable[MuninnEvent]` to support streaming over large datasets.
+All exporters implement the `Exporter` protocol and accept an `AsyncIterable[MuninnEvent]` to support streaming over large datasets without loading the full event log into memory.
+
+### Streaming and Backpressure
+
+Exporters consume events lazily from the `AsyncIterable` source. The write pipeline applies backpressure naturally through the async iteration protocol:
+
+```python
+async def export(self, events: AsyncIterable[MuninnEvent], destination, *, overwrite=False):
+    async with self._open_writer(destination, overwrite) as writer:
+        count = 0
+        async for event in events:
+            await writer.write(self._serialize(event))
+            count += 1
+    return ExportResult(rows_exported=count, ...)
+```
+
+**Backpressure behavior:** If the writer is slower than the event source (e.g., OTLP endpoint is congested), the `async for` loop blocks on `writer.write()`, which naturally slows consumption from the source. No explicit buffering or rate limiting is needed because the async iteration protocol provides flow control implicitly.
+
+**Memory guarantee:** At any point during export, at most one event plus the writer's internal buffer (if any) is held in memory. The pattern is strictly one-event-at-a-time for JSON Lines, batched for Parquet (see batch size below), and batched for OTLP (see flush interval below).
 
 ### JSON Lines Exporter
 
@@ -264,6 +364,8 @@ All exporters implement the `Exporter` protocol and accept an `AsyncIterable[Mun
 - `UUID` values serialize to lowercase hyphenated strings.
 - `None` values serialize to JSON `null`.
 
+**Atomicity:** The exporter writes to a temporary file (`<destination>.tmp`) and renames on success. If the export fails mid-stream, the partial `.tmp` file is deleted and the original destination (if any) is untouched.
+
 ### Parquet Exporter
 
 **Schema mapping:**
@@ -285,23 +387,70 @@ All exporters implement the `Exporter` protocol and accept an `AsyncIterable[Mun
 
 **Write strategy:** Events are buffered into PyArrow `RecordBatch` objects (batch size: 10,000 rows) and written incrementally via `ParquetWriter` to avoid loading the entire export into memory.
 
+**Atomicity:** Same temp-file-and-rename pattern as JSON Lines. A partial Parquet file is not a valid Parquet file (the footer is written last), so a crash mid-export produces an unreadable `.tmp` file that is cleaned up.
+
 ### OTLP Exporter
 
 Maps Muninn events to OpenTelemetry spans for ingestion by tracing backends (Jaeger, Grafana Tempo, etc.).
 
-| MuninnEvent field | OTLP Span field                | Mapping                                                    |
-| ----------------- | ------------------------------ | ---------------------------------------------------------- |
-| `event_id`        | `span_id`                      | UUID truncated to 8 bytes                                  |
-| `session_id`      | `trace_id`                     | Deterministic hash of `session_id` to 16 bytes             |
-| `tool_id`         | `span_name`                    | Direct                                                     |
-| `timestamp`       | `start_time`                   | Direct                                                     |
-| `latency_ms`      | `end_time`                     | `start_time + latency_ms`                                  |
-| `outcome`         | `status`                       | `SUCCESS` → `OK`, `FAILURE` → `ERROR`, `PARTIAL` → `UNSET` |
-| `input_params`    | `attributes`                   | Flattened to key-value pairs (max depth: 2)                |
-| `tags`            | `attributes["twinraven.tags"]` | Comma-separated string                                     |
-| `predecessor`     | `links`                        | Link to predecessor span if present                        |
+**Span construction:**
 
-**Transport:** gRPC via `opentelemetry-exporter-otlp-proto-grpc`. Batch export with configurable flush interval (default: 5 seconds).
+```python
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+# Setup (once, at exporter initialization)
+provider = TracerProvider(
+    resource=Resource.create({
+        "service.name": "twinraven",
+        "service.version": twinraven.__version__,
+        "twinraven.component": "muninn",
+    })
+)
+exporter = OTLPSpanExporter(endpoint=config.endpoint, insecure=config.insecure)
+provider.add_span_processor(BatchSpanProcessor(
+    exporter,
+    max_queue_size=2048,
+    max_export_batch_size=512,
+    schedule_delay_millis=config.flush_interval_seconds * 1000,
+))
+```
+
+**Field mapping:**
+
+| MuninnEvent field | OTLP Span field                      | Mapping                                                                                                          |
+| ----------------- | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `event_id`        | `span_id`                            | UUID truncated to 8 bytes via `xxhash.xxh64(event_id.bytes).digest()[:8]`                                        |
+| `session_id`      | `trace_id`                           | Deterministic hash: `xxhash.xxh128(session_id.encode()).digest()` (16 bytes)                                     |
+| `tool_id`         | `span_name`                          | Direct                                                                                                           |
+| `timestamp`       | `start_time`                         | Direct                                                                                                           |
+| `latency_ms`      | `end_time`                           | `start_time + timedelta(milliseconds=latency_ms)`                                                                |
+| `outcome`         | `status`                             | `SUCCESS` → `StatusCode.OK`, `FAILURE` → `StatusCode.ERROR`, `PARTIAL` → `StatusCode.UNSET`                      |
+| `input_params`    | `attributes`                         | Flattened to key-value pairs (max depth: 2). Nested keys use dot notation: `input.query`, `input.options.format` |
+| `tags`            | `attributes["twinraven.tags"]`       | Comma-separated string                                                                                           |
+| `predecessor`     | `links`                              | Link to predecessor span if present                                                                              |
+| `input_hash`      | `attributes["twinraven.input_hash"]` | Direct                                                                                                           |
+| `outcome`         | `attributes["twinraven.outcome"]`    | String value (in addition to status mapping)                                                                     |
+
+**Resource attributes:** Every span carries the service identity (`service.name`, `service.version`, `twinraven.component`) so spans are identifiable when mixed with other services in a shared tracing backend.
+
+**Transport:** gRPC via `opentelemetry-exporter-otlp-proto-grpc`. Batch export with configurable flush interval (default: 5 seconds). The `BatchSpanProcessor` handles internal queuing and retry.
+
+**Graceful shutdown:** On exporter `close()`, the `BatchSpanProcessor` is flushed with a 30-second timeout to drain any queued spans before the process exits.
+
+### Error Handling and Recovery
+
+| Exporter       | Failure mode                                  | Behavior                                                                                                                                                               | Recovery                                                                 |
+| -------------- | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| **JSON Lines** | Disk full mid-write                           | Temp file is deleted. `ExportError` raised with bytes written.                                                                                                         | Re-run after freeing space. No partial output left behind.               |
+| **JSON Lines** | Destination exists, `overwrite=False`         | `ExportDestinationExistsError` raised before any writing begins.                                                                                                       | Caller passes `overwrite=True` or chooses a different path.              |
+| **Parquet**    | Disk full mid-write                           | Temp file is deleted (partial Parquet is unreadable anyway). `ExportError` raised.                                                                                     | Same as JSON Lines.                                                      |
+| **Parquet**    | Schema mismatch (corrupt event)               | The offending event is logged at `WARNING` and skipped. Other events export normally.                                                                                  | Investigate the corrupt event via `twinraven registry inspect`.          |
+| **OTLP**       | Endpoint unreachable                          | `BatchSpanProcessor` retries internally (configurable). If all retries fail, spans are dropped and logged at `ERROR`. `ExportError` is raised at the `export()` level. | Check endpoint connectivity.                                             |
+| **OTLP**       | Endpoint rejects spans (e.g., quota exceeded) | Treated like unreachable: retry, then drop.                                                                                                                            | Check tracing backend quota/limits.                                      |
+| **OTLP**       | Slow endpoint (congestion)                    | `BatchSpanProcessor` queue absorbs bursts up to `max_queue_size` (2048 spans). Beyond that, oldest spans are dropped.                                                  | Increase flush interval or queue size.                                   |
+| **All**        | Source `AsyncIterable` raises mid-stream      | Events exported so far are committed (JSON via temp file rename, Parquet footer written, OTLP flushed). `ExportError` wraps the original exception.                    | Partial export is valid and contains all events up to the failure point. |
 
 ---
 
